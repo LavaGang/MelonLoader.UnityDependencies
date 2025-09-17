@@ -13,6 +13,7 @@ internal static class Program
     private static string repoOwner = null!;
     private static string repoName = null!;
     private static string repoMainBranch = null!;
+    private static bool isDryRun;
 
     private static readonly GitHubClient github = new(new Octokit.ProductHeaderValue("MelonLoader.UnityDependencies"));
     
@@ -34,9 +35,14 @@ internal static class Program
         
         var token = Environment.GetEnvironmentVariable("GH_TOKEN");
         if (string.IsNullOrEmpty(token))
-            throw new ArgumentException("No token provided; GH_TOKEN environment variable is required.");
-        
-        github.Credentials = new(token);
+        {
+            Console.WriteLine("GH_TOKEN environment variable is not set. Doing a dry run.");
+            isDryRun = true;
+        }
+        else
+        {
+            github.Credentials = new(token);
+        }
         
         http.DefaultRequestHeaders.Add("User-Agent", "Unity web player");
 
@@ -117,41 +123,44 @@ internal static class Program
             }
             managedZipStr.Seek(0, SeekOrigin.Begin);
 
-            Console.WriteLine("Creating a new repo tag");
-            var commitSha = (await github.Repository.Branch.Get(repoOwner, repoName, repoMainBranch)).Commit.Sha;
-            await github.Git.Reference.Create(repoOwner, repoName, new($"refs/tags/{version.ShortName}", commitSha));
-            
-            // Create a draft release, upload all the assets and undraft it
-            Console.WriteLine("Creating a new repo draft release");
-            var release = await github.Repository.Release.Create(repoOwner, repoName, new(version.ShortName)
+            if (!isDryRun)
             {
-                Name = version.ShortName,
-                Body = "Automatically generated and uploaded by the MelonLoader.UnityDependencies Generator",
-                Draft = true
-            });
+                Console.WriteLine("Creating a new repo tag");
+                var commitSha = (await github.Repository.Branch.Get(repoOwner, repoName, repoMainBranch)).Commit.Sha;
+                await github.Git.Reference.Create(repoOwner, repoName, new($"refs/tags/{version.ShortName}", commitSha));
 
-            Console.WriteLine("Uploading Managed.zip");
-            await github.Repository.Release.UploadAsset(release, new("Managed.zip", "application/zip", managedZipStr, TimeSpan.FromMinutes(10)));
+                // Create a draft release, upload all the assets and undraft it
+                Console.WriteLine("Creating a new repo draft release");
+                var release = await github.Repository.Release.Create(repoOwner, repoName, new(version.ShortName)
+                {
+                    Name = version.ShortName,
+                    Body = "Automatically generated and uploaded by the MelonLoader.UnityDependencies Generator",
+                    Draft = true
+                });
 
-            foreach (var dir in Directory.EnumerateDirectories(libsDir))
-            {
-                var libunityPath = Path.Combine(dir, "libunity.so");
-                if (!File.Exists(libunityPath))
-                    continue;
-                
-                var arch = Path.GetFileName(dir);
+                Console.WriteLine("Uploading Managed.zip");
+                await github.Repository.Release.UploadAsset(release, new("Managed.zip", "application/zip", managedZipStr, TimeSpan.FromMinutes(10)));
 
-                var assetName = $"libunity.so.{arch}";
-                
-                Console.WriteLine($"Uploading {assetName}");
-                await using var assetStr = File.OpenRead(libunityPath);
-                await github.Repository.Release.UploadAsset(release, new(assetName, "application/x-msdownload", assetStr, TimeSpan.FromMinutes(10)));
+                foreach (var dir in Directory.EnumerateDirectories(libsDir))
+                {
+                    var libunityPath = Path.Combine(dir, "libunity.so");
+                    if (!File.Exists(libunityPath))
+                        continue;
+
+                    var arch = Path.GetFileName(dir);
+
+                    var assetName = $"libunity.so.{arch}";
+
+                    Console.WriteLine($"Uploading {assetName}");
+                    await using var assetStr = File.OpenRead(libunityPath);
+                    await github.Repository.Release.UploadAsset(release, new(assetName, "application/x-msdownload", assetStr, TimeSpan.FromMinutes(10)));
+                }
+
+                // Undraft it, at which point it becomes public
+                var releaseUpdate = release.ToUpdate();
+                releaseUpdate.Draft = false;
+                await github.Repository.Release.Edit(repoOwner, repoName, release.Id, releaseUpdate);
             }
-            
-            // Undraft it, at which point it becomes public
-            var releaseUpdate = release.ToUpdate();
-            releaseUpdate.Draft = false;
-            await github.Repository.Release.Edit(repoOwner, repoName, release.Id, releaseUpdate);
             
             Console.WriteLine("Done.");
         }
@@ -218,6 +227,7 @@ internal static class Program
         var resp = await http.PostAsync("https://services.unity.com/graphql", new StringContent(body.ToJsonString(), MediaTypeHeaderValue.Parse(MediaTypeNames.Application.Json)));
         resp.EnsureSuccessStatusCode();
 
-        return JsonSerializer.Deserialize<GetUnityReleasesResponse>(await resp.Content.ReadAsStringAsync()) ?? throw new Exception("getUnityReleases returned no content.");
+        var respString = await resp.Content.ReadAsStringAsync();
+        return JsonSerializer.Deserialize<GetUnityReleasesResponse>(respString) ?? throw new Exception("getUnityReleases returned no content.");
     }
 }

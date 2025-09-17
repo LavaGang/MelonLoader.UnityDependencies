@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Generator": {
+      "commandName": "Project",
+      "commandLineArgs": "LavaGang MelonLoader.UnityDependencies main"
+    }
+  }
+}
