@@ -1,9 +1,10 @@
-﻿using System.IO.Compression;
+﻿using Generator.ResponseModels;
+using Octokit;
+using System.IO.Compression;
 using System.Net.Http.Headers;
 using System.Net.Mime;
+using System.Text.Json;
 using System.Text.Json.Nodes;
-using Octokit;
-using ProductHeaderValue = Octokit.ProductHeaderValue;
 
 namespace Generator;
 
@@ -13,25 +14,12 @@ internal static class Program
     private static string repoName = null!;
     private static string repoMainBranch = null!;
 
-    private static readonly GitHubClient github = new GitHubClient(new ProductHeaderValue("MelonLoader.UnityDependencies"));
+    private static readonly GitHubClient github = new(new Octokit.ProductHeaderValue("MelonLoader.UnityDependencies"));
     
     private static readonly HttpClient http = new()
     {
         Timeout = TimeSpan.FromMinutes(10)
     };
-    private static readonly int[] majorVersions =
-    [
-        5,
-        2017,
-        2018,
-        2019,
-        2020,
-        2021,
-        2022,
-        2023,
-        6,
-        7
-    ];
 
     private static async Task Main(string[] args)
     {
@@ -176,39 +164,15 @@ internal static class Program
     private static async Task<IEnumerable<UnityVersion>> GetAvailableVersionsAsync(bool latestBuildsOnly = true, bool stableReleasesOnly = true)
     {
         List<UnityVersion> result = [];
-        foreach (var major in majorVersions)
+
+        var skip = 0;
+        while (true)
         {
-            var body = new JsonObject
+            var resp = await GetUnityReleasesAsync(600, skip);
+
+            foreach (var edge in resp.Data.GetUnityReleases.Edges)
             {
-                ["operationName"] = "GetRelease",
-                ["query"] = "query GetRelease($limit: Int, $skip: Int, $version: String!, $stream: [UnityReleaseStream!]) {\n  getUnityReleases(\n    limit: $limit\n    skip: $skip\n    stream: $stream\n    version: $version\n    entitlements: [XLTS]\n  ) {\n    totalCount\n    edges {\n      node {\n        version\n        entitlements\n        releaseDate\n        unityHubDeepLink\n        stream\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}",
-                ["variables"] = new JsonObject
-                {
-                    ["limit"] = 300,
-                    ["version"] = major.ToString()
-                }
-            };
-
-            var resp = await http.PostAsync("https://services.unity.com/graphql", new StringContent(body.ToJsonString(), MediaTypeHeaderValue.Parse(MediaTypeNames.Application.Json)));
-
-            resp.EnsureSuccessStatusCode();
-
-            var content = await resp.Content.ReadAsStringAsync();
-            var edges = JsonNode.Parse(content)!["data"]!["getUnityReleases"]!["edges"]!.AsArray();
-
-            foreach (var edge in edges)
-            {
-                var node = edge!["node"]!;
-                var version = (string)node["version"]!;
-                var hubLink = (string)node["unityHubDeepLink"]!;
-                
-                var lastSlashIdx = hubLink.LastIndexOf('/');
-                if (lastSlashIdx == -1)
-                    continue;
-                
-                var id = hubLink[(lastSlashIdx + 1)..];
-                
-                if (!UnityVersion.TryParse(version, id, out var unityVer))
+                if (!UnityVersion.TryParse(edge.Node.Version, edge.Node.ShortRevision, out var unityVer))
                     continue;
 
                 if (stableReleasesOnly && unityVer.BuildType != 'f')
@@ -221,15 +185,39 @@ internal static class Program
                     {
                         if (result[otherIdx].BuildNumber < unityVer.BuildNumber)
                             result[otherIdx] = unityVer;
-                        
+
                         continue;
                     }
                 }
-                
+
                 result.Add(unityVer);
             }
+
+            if (!resp.Data.GetUnityReleases.PageInfo.HasNextPage)
+                break;
+
+            skip += resp.Data.GetUnityReleases.Edges.Length;
         }
 
         return result;
+    }
+
+    private static async Task<GetUnityReleasesResponse> GetUnityReleasesAsync(int limit, int skip)
+    {
+        var body = new JsonObject
+        {
+            ["operationName"] = "GetRelease",
+            ["variables"] = new JsonObject
+            {
+                ["limit"] = limit,
+                ["skip"] = skip
+            },
+            ["query"] = "query GetRelease($limit: Int, $skip: Int) { getUnityReleases(limit: $limit, skip: $skip, entitlements: [XLTS]) { pageInfo { hasNextPage }, edges { node { version, shortRevision } } } }"
+        };
+
+        var resp = await http.PostAsync("https://services.unity.com/graphql", new StringContent(body.ToJsonString(), MediaTypeHeaderValue.Parse(MediaTypeNames.Application.Json)));
+        resp.EnsureSuccessStatusCode();
+
+        return JsonSerializer.Deserialize<GetUnityReleasesResponse>(await resp.Content.ReadAsStringAsync()) ?? throw new Exception("getUnityReleases returned no content.");
     }
 }
