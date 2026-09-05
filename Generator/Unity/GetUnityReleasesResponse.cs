@@ -1,6 +1,6 @@
 ﻿using System.Text.Json.Serialization;
 
-namespace Generator.ResponseModels;
+namespace Generator;
 
 public class GetUnityReleasesResponse
 {

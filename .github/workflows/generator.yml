@@ -1,0 +1,34 @@
+on:
+  workflow_call:
+    inputs:
+      UPDATE_EXISTING:
+        required: true
+        type: boolean
+
+jobs:
+  fetchdeps:
+    name: Fetch Dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      
+      - name: Build and Run Generator
+        run: dotnet run --project Generator/Generator.csproj -c Release
+        env: 
+          GitHubApiKey: ${{ secrets.GITHUB_TOKEN }}
+          GitHubRepo: ${{ github.repository }}
+          GitHubRepoBranch: main
+          GitHubUploadPackages: true
+          GitHubUpdateExistingReleases: ${{ inputs.UPDATE_EXISTING }}

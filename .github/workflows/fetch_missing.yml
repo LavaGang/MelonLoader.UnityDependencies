@@ -1,0 +1,22 @@
+name: Fetch Missing Dependencies
+
+on:
+  schedule:
+    - cron: '20 */12 * * *'
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: generate
+  cancel-in-progress: true
+
+jobs:
+  fetchdeps:
+    name: Fetch Dependencies
+    uses: ./.github/workflows/generator.yml
+    secrets: inherit
+    permissions:
+      contents: write
+    with:
+      UPDATE_EXISTING: false

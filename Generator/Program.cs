@@ -1,233 +1,259 @@
-﻿using Generator.ResponseModels;
+﻿using System.Runtime.InteropServices;
+using Generator.Packages;
 using Octokit;
-using System.IO.Compression;
-using System.Net.Http.Headers;
-using System.Net.Mime;
-using System.Text.Json;
-using System.Text.Json.Nodes;
+using Semver;
 
 namespace Generator;
 
 internal static class Program
 {
-    private static string repoOwner = null!;
-    private static string repoName = null!;
-    private static string repoMainBranch = null!;
-    private static bool isDryRun;
+    internal static readonly string _tempDir = Path.Combine(Path.GetDirectoryName(Environment.ProcessPath)!, "Temp");
 
-    private static readonly GitHubClient github = new(new Octokit.ProductHeaderValue("MelonLoader.UnityDependencies"));
-    
-    private static readonly HttpClient http = new()
-    {
-        Timeout = TimeSpan.FromMinutes(10)
+    private const string _releaseBody =
+        "Automatically generated and uploaded by the MelonLoader.UnityDependencies Generator";
+
+    private static readonly UnityVersion _minVersion = new() 
+    { 
+        Id = string.Empty, 
+        SemVer = new SemVersion(5, 3, 0, [ new("b"), new(1) ]),
+        Major = 5, 
+        Minor = 3,
+        Patch = 0, 
+        BuildType = 'b', 
+        BuildNumber = 1
     };
+    
+    private static readonly PackageBase[] _packages =
+    [
+        // Windows
+        new PackageDownload(UnityPlatformID.Windows, Architecture.X64),
+        new PackageDownload(UnityPlatformID.Windows, Architecture.Arm64),
+        
+        // Linux
+        new PackageDownload(UnityPlatformID.Linux, Architecture.X64),
+        
+        // MacOS
+        new PackageDownload(UnityPlatformID.Mac, Architecture.X64),
+        new PackageDownload(UnityPlatformID.Mac, Architecture.Arm64),
+    ];
 
-    private static async Task Main(string[] args)
+    private static IEnumerable<UnityVersion> _unityReleases = [];
+    private static List<RepositoryTag> _githubTags = [];
+    private static List<Release> _githubReleases = [];
+
+    private static async Task RefreshGitHub(bool print = false)
     {
-        if (args.Length < 3)
-        {
-            throw new ArgumentException("The generator requires the following arguments: Repo Owner, Repo Name, Main Branch Name");
-        }
+        // Fetch GitHub Tags
+        if (print)
+            Console.WriteLine("Fetching GitHub Tags...");
+        var tagReadOnly = await GitHubAPI.GetAllTagsAsync();
+        _githubTags = tagReadOnly.ToList();
         
-        repoOwner = args[0];
-        repoName = args[1];
-        repoMainBranch = args[2];
-        
-        var token = Environment.GetEnvironmentVariable("GH_TOKEN");
-        if (string.IsNullOrEmpty(token))
-        {
-            Console.WriteLine("GH_TOKEN environment variable is not set. Doing a dry run.");
-            isDryRun = true;
-        }
-        else
-        {
-            github.Credentials = new(token);
-        }
-        
-        http.DefaultRequestHeaders.Add("User-Agent", Config.UserAgent);
-
-        Console.WriteLine("Fetching available releases");
-        var versions = await GetAvailableVersionsAsync();
-
-        Console.WriteLine("Fetching existing releases");
-        var releases = await github.Repository.Release.GetAll(repoOwner, repoName);
-        
-        foreach (var version in versions)
-        {
-            if (releases.Any(x => x.TagName == version.ShortName))
-                continue;
-
-            await ProcessVersionAsync(version);
-        }
+        // Fetch GitHub Releases
+        if (print)
+            Console.WriteLine("Fetching GitHub Releases...");
+        var releaseReadOnly = await GitHubAPI.GetAllReleasesAsync();
+        _githubReleases = releaseReadOnly.ToList();
     }
 
-    private static async Task ProcessVersionAsync(UnityVersion version)
+    // Herp:
+    // Releases set as Draft signify generation failure/cancellation
+    // Releases set as Prelease signify regeneration was requested and is awaiting to be reprocessed
+    private static async Task Main()
     {
-        // Exclude older versions that do not have the android support bundle
-        if (version.Major < 5 || version is { Major: 5, Minor: < 3 })
+        // Load Configuration
+        Console.WriteLine("Loading Environment Configuration...");
+        Config.Load();
+
+        // Fetch Unity Releases
+        Console.WriteLine("Fetching Unity Releases...");
+        _unityReleases = await UnityAPI.GetAvailableVersionsAsync(false, false);
+        if (_unityReleases.Count() <= 0)
+        {
+            Console.WriteLine("Failed to Fetch Unity Releases!");
             return;
-        
-        Console.WriteLine();
-        Console.WriteLine($"Processing version {version}");
-
-        var monoBundleUrl = $"https://download.unity3d.com/download_unity/{version.Id}/MacEditorTargetInstaller/UnitySetup-Android-Support-for-Editor-{version}.pkg";
-
-        var tempDir = Path.Combine(Path.GetDirectoryName(Environment.ProcessPath)!, "gen.temp");
-        if (Directory.Exists(tempDir))
-        {
-            Directory.Delete(tempDir, true);
         }
-        Directory.CreateDirectory(tempDir);
-        try
+        
+        // Set All as Prereleases to signify Regeneration
+        UnityVersion? githubLatest = null;
+        if (Config.GitHubUploadPackages)
         {
-            var pkgPath = Path.Combine(tempDir, "mono.pkg");
+            // Refresh GitHub Listing
+            await RefreshGitHub(true);
+            githubLatest = FindLatest();
             
-            Console.WriteLine("Downloading the Android Bundle");
-            using (var resp = await http.GetAsync(monoBundleUrl, HttpCompletionOption.ResponseContentRead))
+            if (Config.GitHubUpdateExistingReleases)
             {
-                if (!resp.IsSuccessStatusCode)
+                if (Config.GitHubPurgeExistingReleases)
+                    Console.WriteLine("Purging Existing Releases...");
+                else
+                    Console.WriteLine("Applying Prerelease Tag to signify regeneration...");
+                foreach (var unityVersion in _unityReleases)
                 {
-                    Console.WriteLine("No bundle found. Skipping...");
-                    return;
-                }
-
-                await using var fileStr = File.Create(pkgPath);
-                await resp.Content.CopyToAsync(fileStr);
-            }
-            
-            Console.WriteLine("Extracting the Payload Archive");
-            await SevenZip.ExtractAsync(pkgPath, tempDir, false, "TargetSupport.pkg.tmp/Payload");
-            File.Delete(pkgPath);
-            
-            var payloadArchPath = Path.Combine(tempDir, "Payload");
-            Console.WriteLine("Extracting the Payload Archive Archive");
-            await SevenZip.ExtractAsync(payloadArchPath, tempDir, false);
-            File.Delete(payloadArchPath);
-            
-            var payloadPath = Path.Combine(tempDir, "Payload~");
-            Console.WriteLine("Extracting the last one...");
-            await SevenZip.ExtractAsync(payloadPath, tempDir, true, "./Variations/il2cpp/Managed/*", "./Variations/il2cpp/Release/Libs/*");
-            File.Delete(payloadPath);
-            
-            var managedDir = Path.Combine(tempDir, "Variations", "il2cpp", "Managed");
-            var libsDir = Path.Combine(tempDir, "Variations", "il2cpp", "Release", "Libs");
-            
-            Console.WriteLine("Bundling Managed.zip");
-            using var managedZipStr = new MemoryStream();
-            using (var managedZip = new ZipArchive(managedZipStr, ZipArchiveMode.Create, true))
-            {
-                foreach (var file in Directory.EnumerateFiles(managedDir, "*.dll"))
-                {
-                    managedZip.CreateEntryFromFile(file, Path.GetFileName(file));
-                }
-            }
-            managedZipStr.Seek(0, SeekOrigin.Begin);
-
-            if (!isDryRun)
-            {
-                Console.WriteLine("Creating a new repo tag");
-                var commitSha = (await github.Repository.Branch.Get(repoOwner, repoName, repoMainBranch)).Commit.Sha;
-                await github.Git.Reference.Create(repoOwner, repoName, new($"refs/tags/{version.ShortName}", commitSha));
-
-                // Create a draft release, upload all the assets and undraft it
-                Console.WriteLine("Creating a new repo draft release");
-                var release = await github.Repository.Release.Create(repoOwner, repoName, new(version.ShortName)
-                {
-                    Name = version.ShortName,
-                    Body = "Automatically generated and uploaded by the MelonLoader.UnityDependencies Generator",
-                    Draft = true
-                });
-
-                Console.WriteLine("Uploading Managed.zip");
-                await github.Repository.Release.UploadAsset(release, new("Managed.zip", "application/zip", managedZipStr, TimeSpan.FromMinutes(10)));
-
-                foreach (var dir in Directory.EnumerateDirectories(libsDir))
-                {
-                    var libunityPath = Path.Combine(dir, "libunity.so");
-                    if (!File.Exists(libunityPath))
+                    string tag = unityVersion.ToString();
+                    Release? ghRel = FindGitHubRelease(tag);
+                    if (ghRel == null)
                         continue;
 
-                    var arch = Path.GetFileName(dir);
-
-                    var assetName = $"libunity.so.{arch}";
-
-                    Console.WriteLine($"Uploading {assetName}");
-                    await using var assetStr = File.OpenRead(libunityPath);
-                    await github.Repository.Release.UploadAsset(release, new(assetName, "application/x-msdownload", assetStr, TimeSpan.FromMinutes(10)));
-                }
-
-                // Undraft it, at which point it becomes public
-                var releaseUpdate = release.ToUpdate();
-                releaseUpdate.Draft = false;
-                await github.Repository.Release.Edit(repoOwner, repoName, release.Id, releaseUpdate);
-            }
-            
-            Console.WriteLine("Done.");
-        }
-        finally
-        {
-            Directory.Delete(tempDir, true);
-        }
-    }
-
-    private static async Task<IEnumerable<UnityVersion>> GetAvailableVersionsAsync(bool latestBuildsOnly = true, bool stableReleasesOnly = true)
-    {
-        List<UnityVersion> result = [];
-
-        var skip = 0;
-        while (true)
-        {
-            var resp = await GetUnityReleasesAsync(Config.PageSize, skip);
-
-            foreach (var edge in resp.Data.GetUnityReleases.Edges)
-            {
-                if (!UnityVersion.TryParse(edge.Node.Version, edge.Node.ShortRevision, out var unityVer))
-                    continue;
-
-                if (stableReleasesOnly && unityVer.BuildType != 'f')
-                    continue;
-
-                if (latestBuildsOnly)
-                {
-                    var otherIdx = result.FindIndex(x => x.Major == unityVer.Major && x.Minor == unityVer.Minor && x.Patch == unityVer.Patch && x.BuildType == unityVer.BuildType);
-                    if (otherIdx != -1)
+                    if (Config.GitHubPurgeExistingReleases)
                     {
-                        if (result[otherIdx].BuildNumber < unityVer.BuildNumber)
-                            result[otherIdx] = unityVer;
-
+                        Console.WriteLine(ghRel.TagName);
+                        await GitHubAPI.DeleteRelease(ghRel);
                         continue;
                     }
+                    
+                    if (ghRel is { Draft: false } and { Prerelease: false })
+                    {
+                        Console.WriteLine(ghRel.TagName);
+                        await GitHubAPI.SetReleaseType(ghRel!, eReleaseType.Prelease);
+                    }
                 }
-
-                result.Add(unityVer);
+                
+                Console.WriteLine("Pruning Tags without Releases...");
+                foreach (var tag in _githubTags)
+                {
+                    string tagName = tag.Name;
+                    if (FindGitHubRelease(tagName) == null)
+                    {
+                        Console.WriteLine(tagName);
+                        await GitHubAPI.DeleteTagAsync(tagName);
+                    }
+                }
             }
-
-            if (!resp.Data.GetUnityReleases.PageInfo.HasNextPage)
-                break;
-
-            skip += resp.Data.GetUnityReleases.Edges.Length;
         }
 
-        return result;
+        // Process Releases
+        Console.WriteLine();
+        foreach (var unityVersion in _unityReleases)
+        {
+            // Exclude versions that aren't supported by extraction
+            if (unityVersion.SemVer.ComparePrecedenceTo(_minVersion.SemVer) <= 0)
+                continue;
+            
+            // Exclude versions that aren't specifically targeted
+            string tag = unityVersion.ToString();
+            if (!string.IsNullOrEmpty(Config.UnityTargetVersion)
+                && (tag != Config.UnityTargetVersion)) 
+                continue;
+
+            // GitHub Handling
+            RepositoryTag? githubTag = null;
+            Release? githubRelease = null;
+            if (Config.GitHubUploadPackages)
+            {
+                // Find Tag
+                githubTag = FindGitHubTag(tag);
+                if (githubTag == null)
+                {
+                    await GitHubAPI.CreateGitTag(tag, _releaseBody);
+                    await RefreshGitHub();
+                    githubTag = FindGitHubTag(tag);
+                }
+
+                // Find Release
+                githubRelease = FindGitHubRelease(tag);
+                if (githubRelease == null)
+                {
+                    githubRelease = await GitHubAPI.CreateRelease(tag, tag, _releaseBody, true);
+                    await RefreshGitHub();
+                }
+                else
+                {
+                    // Exclude anything that is not a Draft or Prelease
+                    if (githubRelease is { Draft: false } and { Prerelease: false })
+                        continue;
+                    
+                    // Clear Release of Assets
+                    Console.WriteLine($"Pruning Existing Assets...");
+                    foreach (var asset in await GitHubAPI.GetAllReleaseAssets(githubRelease))
+                        await GitHubAPI.DeleteAsset(asset);
+                }
+            }
+            
+
+            // Handle Packages
+            Console.WriteLine($"Processing {tag}...");
+            Console.WriteLine();
+            bool success = true;
+            foreach (var package in _packages)
+            {
+                if (await TryProcess(package, githubRelease, unityVersion))
+                    continue;
+                success = false;
+                break;
+            }
+            if (!success)
+                continue;
+
+            // Set Release as Public
+            if (Config.GitHubUploadPackages)
+            {
+                if ((githubLatest == null)
+                    || (githubLatest.Value.SemVer.ComparePrecedenceTo(githubLatest.Value.SemVer) <= 0))
+                {
+                    githubLatest = unityVersion;
+                    await GitHubAPI.SetReleaseType(githubRelease!, eReleaseType.Latest);
+                }
+                else 
+                    await GitHubAPI.SetReleaseType(githubRelease!, eReleaseType.None);
+            }
+        }
+    }
+    
+    private static RepositoryTag? FindGitHubTag(string tag)
+        => _githubTags.FirstOrDefault(x => x.Name == tag);
+    private static Release? FindGitHubRelease(string tag)
+        => _githubReleases.FirstOrDefault(x => x.TagName == tag);
+
+    private static UnityVersion? FindLatest()
+    {
+        UnityVersion? latest = null;
+        foreach (var release in _githubReleases)
+            if (release is { Draft: false } and { Prerelease: false })
+            {
+                if (!UnityVersion.TryParse(release.TagName, string.Empty, out UnityVersion releaseVersion))
+                    continue;
+                if ((latest == null)
+                    || (latest.Value.SemVer.ComparePrecedenceTo(releaseVersion.SemVer) <= 0))
+                    latest = releaseVersion;
+            }
+        return latest;
     }
 
-    private static async Task<GetUnityReleasesResponse> GetUnityReleasesAsync(int limit, int skip)
+    private static async Task<bool> TryProcess(
+        PackageBase package,
+        Release? release,
+        UnityVersion unityVersion)
     {
-        var body = new JsonObject
+        // Create Temporary Directory
+        if (!Config.KeepTempFolder
+            && Directory.Exists(_tempDir))
+            Directory.Delete(_tempDir, true);
+        if (!Directory.Exists(_tempDir))
+            Directory.CreateDirectory(_tempDir);
+
+        // Process Package
+        bool success = true;
+        try
         {
-            ["operationName"] = "GetRelease",
-            ["variables"] = new JsonObject
-            {
-                ["limit"] = limit,
-                ["skip"] = skip
-            },
-            ["query"] = "query GetRelease($limit: Int, $skip: Int) { getUnityReleases(limit: $limit, skip: $skip, entitlements: [XLTS]) { pageInfo { hasNextPage }, edges { node { version, shortRevision } } } }"
-        };
-
-        var resp = await http.PostAsync(Config.GraphQLApiUrl, new StringContent(body.ToJsonString(), MediaTypeHeaderValue.Parse(MediaTypeNames.Application.Json)));
-        resp.EnsureSuccessStatusCode();
-
-        var respString = await resp.Content.ReadAsStringAsync();
-        return JsonSerializer.Deserialize<GetUnityReleasesResponse>(respString) ?? throw new Exception("getUnityReleases returned no content.");
+            if (await package.Download(unityVersion)
+                && await package.Extract())
+                await package.Bundle(release);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e);
+            success = false;
+        }
+        
+        // Remove Temporary Directory
+        if (!Config.KeepTempFolder
+            && Directory.Exists(_tempDir))
+            Directory.Delete(_tempDir, true);
+        
+        Console.WriteLine();
+        Console.WriteLine("------");
+        Console.WriteLine();
+        return success;
     }
 }
